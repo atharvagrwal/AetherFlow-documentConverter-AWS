@@ -1,4 +1,4 @@
-# AetherFlow-documentConverter-AWS
+# Enterprise Cloud Document Processing Pipeline: Architecture Report & Implementation Guide
 
 **Course:** Introduction to Cloud Computing  
 **Institution:** Ostbayerische Technische Hochschule Regensburg  
@@ -24,7 +24,49 @@ The pure serverless micro-engine was selected for the final production deploymen
 
 The operational data path for the production environment runs entirely over a managed, event-driven, serverless pipeline:
 
-[ Frontend Web Client ]│▼ (1. POST /convert: Request Ingestion Presigned URL)[ Amazon API Gateway ] ───► [ Lambda: GenerateUploadURL ]│                                │ (Returns Crytographic Upload Token)▼ (2. Direct Binary PUT Upload)  ▼[ Amazon S3 Bucket ] (uploads/ raw prefix layer)│▼ (3. Automated S3:ObjectCreated:* Notification)[ Lambda: docx-to-pdf-converter ] ───► [ Adobe PDF Services API Cloud Engine ]│                                            │ (Processes File Stream)▼ (4. Pushes Finalized Byte Array)           ▼[ Amazon S3 Bucket ] (converted/ egress prefix layer)│▼ (5. Direct Synchronous State Commit: status="completed")[ Amazon DynamoDB (DocumentMetadata Table) ] ◄─── [ Lambda: CheckAndGetPDF ]▲│ (6. HTTP GET Polling Loop)[ Frontend Client ]
+┌────────────────────────────────────────┐
+       │          Frontend Web Client           │
+       └───────────────────┬────────────────────┘
+                           │
+                           │ (1) POST /convert (Request Upload URL)
+                           ▼
+       ┌────────────────────────────────────────┐
+       │          Amazon API Gateway            ├───────────┐
+       └───────────────────┬────────────────────┘           │
+                           │                                │ (1.1) Invoke
+                           │ (2) Returns                    ▼
+                           │     Pre-signed URL    ┌────────────────────────────────┐
+                           │                       │  Lambda: GenerateUploadURL     │
+                           ▼                       └────────────────────────────────┘
+       ┌────────────────────────────────────────┐
+       │     S3 Bucket: uploads/ (Landing)      │◄──────────────────────────────┐
+       └───────────────────┬────────────────────┘                               │
+                           │                                                    │
+                           │ (3) s3:ObjectCreated:* Event Trigger               │
+                           ▼                                                    │
+       ┌────────────────────────────────────────┐                               │
+       │     Lambda: docx-to-pdf-converter      ├───────────┐                   │
+       └───────────────────┬────────────────────┘           │                   │
+                           │                                │ (3.1) Convert     │
+                           │ (4) Uploads                    ▼                   │
+                           │     Completed PDF     ┌────────────────────────────────┐   │ (4.2) Deletes
+                           ▼                       │  Adobe PDF Services API Cloud  │   │       Source File
+       ┌────────────────────────────────────────┐  └────────────────────────────────┘   │
+       │    S3 Bucket: converted/ (Output)      │───────────────────────────────────────┘
+       └───────────────────┬────────────────────┘
+                           │
+                           │ (4.1) Log State (status="completed", pdf_url)
+                           ▼
+       ┌────────────────────────────────────────┐            (5) GET /check-pdf
+       │  DynamoDB Table (DocumentMetadata)     │◄──────────────────────────────────┐
+       └────────────────────────────────────────┘                                   │
+                                                                                    │
+                                                                        ┌───────────┴───────────┐
+                                                                        │    Frontend Client    │
+                                                                        │  (HTTP Polling Loop)  │
+                                                                        └───────────────────────┘
+
+
 ### Infrastructure Component Matrix
 *   **Frontend Tier:** Deployed as an asynchronous Single Page Application (SPA) on **AWS Amplify Hosting**, with automated edge delivery optimization and managed SSL termination.
 *   **API Gateway Tier:** Managed **Amazon API Gateway (HTTP API Type)** running Payload Format Version `1.0`. It handles cross-origin resource sharing (CORS) preflight handshakes across domains.
@@ -45,6 +87,7 @@ The operational data path for the production environment runs entirely over a ma
 │   ├── docx-to-pdf-converter.py # Primary worker orchestrating Adobe SDK & DynamoDB commits
 │   └── CheckAndGetPDF.py        # Case-insensitive data-layer fallback checker service
 └── README.md                    # System implementation & technical report overview
+
 4. Source Code Architecture4.1 Frontend Client Upload & Polling Orchestration (frontend/index.html)The frontend client interface safely transmits documents via pre-signed URLs and tracks processing milestones using an asynchronous background polling routine.JavaScript// Phase 1: Upload raw binary content to S3 using the pre-signed URL token
 async function uploadToS3(uploadUrl, file) {
     const uploadResponse = await fetch(uploadUrl, {
@@ -80,47 +123,48 @@ async function checkIfFileExists(checkApiUrl, fileName) {
         await new Promise(resolve => setTimeout(resolve, 5000)); // 5-second polling interval
     }
 }
-4.2 Backend Ingestion Layer (backend/GenerateUploadURL.py)This function processes initial client upload requests and issues secure, short-lived pre-signed URLs.Pythonimport boto3
-import json
+## 4. Source Code Architecture
 
-REGION = "eu-central-1"
-s3 = boto3.client("s3", region_name=REGION)
-BUCKET_NAME = "doc-converter-s3-bucket-2026"
+### 4.1 Frontend Client Upload & Polling Orchestration (`frontend/index.html`)
+The frontend client interface safely transmits documents via pre-signed URLs and tracks processing milestones using an asynchronous background polling routine.
 
-def lambda_handler(event, context):
-    cors_headers = {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "POST, GET, OPTIONS, PUT",
-        "Access-Control-Allow-Headers": "Content-Type,Authorization,X-Amz-Date"
-    }
-    try:
-        body = json.loads(event.get("body", "{}"))
-        file_name = body.get("file_name")
-        file_type = body.get("file_type", "application/octet-stream")
+```javascript
+// Phase 1: Upload raw binary content to S3 using the pre-signed URL token
+async function uploadToS3(uploadUrl, file) {
+    const uploadResponse = await fetch(uploadUrl, {
+        method: 'PUT',
+        body: file,
+        headers: { "Content-Type": file.type }
+    });
+    if (!uploadResponse.ok) throw new Error("Binary object transmission rejected by S3.");
+    console.log("Direct S3 payload ingest completed successfully.");
+}
 
-        if not file_name:
-            return {
-                "statusCode": 400,
-                "headers": cors_headers,
-                "body": json.dumps({"error": "Missing parameter 'file_name'"})
+// Phase 2: Asynchronous background polling routine checking state availability
+async function checkIfFileExists(checkApiUrl, fileName) {
+    const pdfFileName = fileName.replace(/\.[^.]+$/, ".pdf");
+    const encodedFileName = encodeURIComponent(`converted/${pdfFileName}`);
+    const targetUrl = `${checkApiUrl}?file_name=${encodedFileName}`;
+
+    while (true) {
+        try {
+            const response = await fetch(targetUrl, { method: 'GET' });
+            if (response.status === 200) {
+                const data = await response.json();
+                renderDownloadButton(data.url); // Displays download option to client
+                break;
+            } else if (response.status === 404) {
+                console.log("File processing incomplete. Polling database state...");
+            } else {
+                throw new Error("Unexpected API feedback state.");
             }
+        } catch (err) {
+            console.error("Polling check iteration skipped:", err);
+        }
+        await new Promise(resolve => setTimeout(resolve, 5000)); // 5-second polling interval
+    }
+}
 
-        upload_url = s3.generate_presigned_url(
-            "put_object",
-            Params={"Bucket": BUCKET_NAME, "Key": f"uploads/{file_name}", "ContentType": file_type},
-            ExpiresIn=300
-        )
-        return {
-            "statusCode": 200,
-            "headers": cors_headers,
-            "body": json.dumps({"upload_url": upload_url})
-        }
-    except Exception as e:
-        return {
-            "statusCode": 500,
-            "headers": cors_headers,
-            "body": json.dumps({"error": str(e)})
-        }
 4.3 Core Serverless Conversion & Database Commits (backend/docx-to-pdf-converter.py)This primary worker function downloads incoming objects from S3, streams them to the Adobe Cloud API for processing, and synchronously logs the resulting asset URL to DynamoDB.Pythonimport os
 import boto3
 import urllib.parse
@@ -233,10 +277,11 @@ def lambda_handler(event, context):
 5. Architectural Evaluation: Containers vs. ServerlessArchitectural Evaluation MetricMethod 1: Containerized ECS Fargate ClusterMethod 2: Pure Serverless Cloud PipelineAverage End-to-End Latency~45 to 60 Seconds (Container provisioning lag)~5 to 7 Seconds (Instant event invocation)Infrastructure ManagementHigh (Required explicit networks, tasks, VPCs)Zero (Fully abstract managed ecosystem)Scaling CharacteristicsScaling throttled by cluster pool capacityInstant microsecond vertical scalingCost Profile OptimizationCharged continuously per active task-minutePay-per-use allocation down to the millisecond6. Security & Governance MatrixGranular Identity Boundaries (IAM Execution Roles): Each microservice runs under its own distinct IAM execution role, ensuring absolute compliance with the principle of least privilege.Cryptographic Access Separation: Client components have no permanent read/write access to S3 or DynamoDB data. Data transmission is authorized using short-lived, cryptographically signed pre-signed URLs that automatically expire after 1 hour.Data Ephemerality & Lifecycle Rules: Files are processed dynamically in temporary, short-lived /tmp runtime execution blocks. S3 objects utilize automated bucket lifecycle expiration rules to permanently delete transient documents after 24 hours.7. Production Deployment & Verification TracesAWS CLI Deployed Component Verification CommandsExecute these bash tracking scripts to audit and verify your active production resources:Bash# 1. Verify DynamoDB DocumentMetadata Table Status
 aws dynamodb describe-table --table-name DocumentMetadata --query "Table.TableStatus" --region eu-central-1
 
-# 2. Audit S3 Event Notification Configuration
+## 2. Audit S3 Event Notification Configuration
 aws s3api get-bucket-notification-configuration --bucket doc-converter-s3-bucket-2026 --region eu-central-1
 
-# 3. List the deployed Lambda functions in eu-central-1
+## 3. List the deployed Lambda functions in eu-central-1
+```js
 aws lambda list-functions --query "Functions[*].FunctionName" --output table --region eu-central-1
 Deployed System Log Output ProofThe following trace from the docx-to-pdf-converter CloudWatch log stream demonstrates successful document processing with no access denials or performance bottlenecks:Plaintext2026-05-31T14:18:01.820Z START RequestId: 14e1187a-07d9-4da5-a18a-1bc16c03e078 Version: $LATEST
 2026-05-31T14:18:01.822Z ==== LAMBDA S3 TRIGGER START ====
@@ -248,3 +293,4 @@ Deployed System Log Output ProofThe following trace from the docx-to-pdf-convert
 2026-05-31T14:18:06.191Z Successfully recorded production URL metrics directly to the data layer.
 2026-05-31T14:18:06.193Z END RequestId: 14e1187a-07d9-4da5-a18a-1bc16c03e078
 2026-05-31T14:18:06.193Z REPORT RequestId: 14e1187a-07d9-4da5-a18a-1bc16c03e078 Duration: 4371 ms Billed Duration: 4400 ms Memory Size: 2024 MB Max Memory Used: 109 MB
+```
