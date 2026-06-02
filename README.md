@@ -389,29 +389,6 @@ Duration: 4371 ms
 ![Conversion Success](screenshots/conversion-success.png)
 ```
 
-## S3 Bucket Structure
-
-```markdown
-![S3 Bucket](screenshots/s3-bucket.png)
-```
-
-## Lambda Configuration
-
-```markdown
-![Lambda Configuration](screenshots/lambda.png)
-```
-
-## DynamoDB Table
-
-```markdown
-![DynamoDB](screenshots/dynamodb.png)
-```
-
-## CloudWatch Logs
-
-```markdown
-![CloudWatch Logs](screenshots/cloudwatch.png)
-```
 
 ---
 
